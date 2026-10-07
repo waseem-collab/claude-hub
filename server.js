@@ -23,6 +23,8 @@ const HOST_IDLE_MS = 30 * 60 * 1000;
 const CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'claude-hub');
 const CONNECTIONS_FILE = path.join(CONFIG_DIR, 'connections.json');
 const TITLES_FILE = path.join(CONFIG_DIR, 'titles.json');
+const UPLOAD_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'claude-hub', 'uploads');
+const UPLOAD_MAX = 100 * 1024 * 1024;
 
 // Chat names set from the hub. Also written into the transcript, but kept here so a rename
 // survives even when that line scrolls out of the part of a big transcript we read.
@@ -333,13 +335,13 @@ function sessionList() {
     if (!m.title && !term && !host) continue;
     list.push({
       id,
-      title: titles[id] || m.title || (term && term.name) || 'New conversation',
+      title: (host && host.temp && (titles[id] || host.title)) || titles[id] || m.title || (term && term.name) || 'New conversation',
       cwd: m.cwd || (term && term.cwd) || (host && host.cwd) || null,
       mtime: m.mtimeMs || (term && term.startedAt) || Date.now(),
       permissionMode: m.permissionMode,
       model: m.model,
       terminal: term ? { pid: term.pid, status: term.status, name: term.name } : null,
-      hosted: host ? { status: host.status, permissionMode: host.permissionMode, model: host.model } : null,
+      hosted: host ? { status: host.status, permissionMode: host.permissionMode, model: host.model, temporary: host.temp } : null,
     });
   }
   list.sort((a, b) => b.mtime - a.mtime);
@@ -424,8 +426,12 @@ function launchConfig() {
 const hosts = new Map(); // sessionId -> Host
 
 class Host {
-  constructor({ id, cwd, resume, fork, permissionMode, model }) {
+  constructor({ id, cwd, resume, fork, permissionMode, model, temporary }) {
     this.id = id;
+    // Temporary chats are never written to disk; their transcript lives only in this.items.
+    this.temp = !!temporary;
+    this.items = [];
+    this.title = '';
     this.cwd = cwd;
     this.permissionMode = permissionMode || 'manual';
     this.model = model || null;
@@ -438,6 +444,9 @@ class Host {
     if (resume) args.push('--resume', resume);
     else args.push('--session-id', id);
     if (fork) args.push('--fork-session');
+    if (this.temp) args.push('--no-session-persistence');
+    // uploaded files live outside the project; let Claude read them without a prompt
+    args.push('--add-dir', UPLOAD_DIR);
     if (model) args.push('--model', model);
     const extra = launchConfig();
     args.push(...extra.args);
@@ -476,7 +485,18 @@ class Host {
     if (this.proc.stdin.writable) this.proc.stdin.write(JSON.stringify(obj) + '\n');
   }
 
+  pushItems(items) {
+    if (!items.length) return;
+    const from = this.items.length;
+    this.items.push(...items);
+    for (const c of subscribersOf(this.id)) sse(c.res, 'items', { from, items });
+  }
+
   send(text) {
+    if (this.temp) {
+      if (!this.title) this.title = text.replace(/\[Attached file: [^\]]*\]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'Temporary chat';
+      this.pushItems([{ uuid: crypto.randomUUID(), ts: new Date().toISOString(), kind: 'user', text }]);
+    }
     this.lastActive = Date.now();
     this.setStatus('busy');
     this.write({ type: 'user', message: { role: 'user', content: text } });
@@ -495,6 +515,9 @@ class Host {
 
   handle(evt) {
     this.lastActive = Date.now();
+    if (this.temp && (evt.type === 'assistant' || evt.type === 'user') && !evt.parent_tool_use_id && evt.message) {
+      this.pushItems(entryToItems({ type: evt.type, message: evt.message, uuid: evt.uuid || crypto.randomUUID(), timestamp: new Date().toISOString() }));
+    }
     if (evt.type === 'system' && evt.subtype === 'init') {
       if (evt.session_id && evt.session_id !== this.id) {
         const old = this.id;
@@ -728,13 +751,52 @@ async function api(req, res, url) {
     }
   }
 
+  if (method === 'POST' && parts[1] === 'upload') {
+    // raw body upload: /api/upload?name=<file name>
+    const raw = path.basename(String(url.searchParams.get('name') || 'file')).replace(/[\x00-\x1f/\\]/g, '_').slice(-120) || 'file';
+    const dir = path.join(UPLOAD_DIR, new Date().toISOString().slice(0, 10), crypto.randomBytes(4).toString('hex'));
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const dest = path.join(dir, raw);
+    let size = 0;
+    try {
+      await new Promise((resolve, reject) => {
+        const out = fs.createWriteStream(dest, { mode: 0o600 });
+        req.on('data', chunk => {
+          size += chunk.length;
+          if (size > UPLOAD_MAX) { req.destroy(); out.destroy(); reject(new Error('File is larger than 100 MB')); }
+        });
+        req.pipe(out);
+        out.on('finish', resolve);
+        out.on('error', reject);
+        req.on('error', reject);
+      });
+    } catch (e) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return json(res, 413, { error: e.message });
+    }
+    return json(res, 200, { path: dest, name: raw, size });
+  }
+
+  if (method === 'GET' && parts[1] === 'upload-file') {
+    // serves only files inside the uploads folder (for image previews)
+    let real;
+    try { real = fs.realpathSync(String(url.searchParams.get('path') || '')); } catch { return json(res, 404, { error: 'Not found' }); }
+    const root = fs.existsSync(UPLOAD_DIR) ? fs.realpathSync(UPLOAD_DIR) : UPLOAD_DIR;
+    if (!real.startsWith(root + path.sep)) return json(res, 403, { error: 'Forbidden' });
+    const ext = path.extname(real).toLowerCase();
+    const type = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml' }[ext] || 'application/octet-stream';
+    res.writeHead(200, { 'content-type': type, 'cache-control': 'private, max-age=86400', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'", 'x-content-type-options': 'nosniff' });
+    fs.createReadStream(real).pipe(res);
+    return;
+  }
+
   if (method === 'POST' && parts[1] === 'new') {
     const b = await body(req);
     const cwd = path.resolve((b.cwd || os.homedir()).replace(/^~(?=$|\/)/, os.homedir()));
     if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) return json(res, 400, { error: `Folder not found: ${cwd}` });
     if (!b.text || !b.text.trim()) return json(res, 400, { error: 'Empty message' });
     const id = crypto.randomUUID();
-    const host = new Host({ id, cwd, permissionMode: b.permissionMode, model: b.model });
+    const host = new Host({ id, cwd, permissionMode: b.permissionMode, model: b.model, temporary: !!b.temporary });
     hosts.set(id, host);
     host.send(b.text);
     broadcastSessions(true);
@@ -746,7 +808,10 @@ async function api(req, res, url) {
     const action = parts[3];
 
     if (method === 'GET' && action === 'items') {
+      const th = hosts.get(id);
+      if (th && th.temp) return json(res, 200, { items: th.items, start: 0, total: th.items.length, temporary: true });
       if (!sessions.has(id)) await scanSessions();
+      if (!sessions.has(id) && !hosts.has(id) && !terminalLive.has(id)) return json(res, 200, { items: [], start: 0, total: 0, gone: true });
       const t = await loadTranscript(id);
       if (!t) return json(res, 200, { items: [], start: 0, total: 0 });
       const before = url.searchParams.has('before') ? Number(url.searchParams.get('before')) : t.items.length;
@@ -757,6 +822,7 @@ async function api(req, res, url) {
     if (method === 'POST' && action === 'send') {
       const b = await body(req);
       if (!b.text || !b.text.trim()) return json(res, 400, { error: 'Empty message' });
+      if (!hosts.has(id) && !sessions.has(id) && !terminalLive.has(id)) return json(res, 410, { error: 'This temporary chat has ended. Start a new one.' });
       let h = hosts.get(id);
       // Connections changed since this process started: restart it (same session) so it sees them.
       if (h && h.status === 'idle' && !h.pending.size && h.configVersion !== configVersion) {
@@ -806,6 +872,8 @@ async function api(req, res, url) {
 
     if (method === 'POST' && action === 'rename') {
       const title = String((await body(req)).title || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+      const th = hosts.get(id);
+      if (th && th.temp) { th.title = title || th.title; broadcastSessions(true); return json(res, 200, { ok: true, title: th.title }); }
       if (title) titles[id] = title; else delete titles[id];
       saveTitles();
       const m = sessions.get(id);
@@ -818,6 +886,8 @@ async function api(req, res, url) {
     }
 
     if (method === 'POST' && action === 'delete') {
+      const th = hosts.get(id);
+      if (th && th.temp) { th.stop(); hosts.delete(id); broadcastSessions(true); return json(res, 200, { ok: true, trashed: false }); }
       const term = terminalLive.get(id);
       if (term) return json(res, 409, { error: 'This chat is open in a terminal. Close it there first.' });
       const h = hosts.get(id);
@@ -875,19 +945,36 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-function shutdown() {
+function stopHosts() {
   for (const h of hosts.values()) { try { h.proc.kill('SIGTERM'); } catch { /* gone */ } }
+}
+
+function shutdown() {
+  stopHosts();
   process.exit(0);
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
 
-(async () => {
+// Resolves once the server is listening; rejects if the port can't be used.
+async function start() {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true, mode: 0o700 });
   loadConnections();
   await scanSessions();
   terminalLive = await readRegistry();
-  server.listen(PORT, HOST, () => {
-    console.log(`Claude Hub running at http://localhost:${PORT}`);
-    console.log(`Using claude at ${CLAUDE_BIN} · ${sessions.size} sessions found`);
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(PORT, HOST, () => {
+      console.log(`Claude Hub running at http://localhost:${PORT}`);
+      console.log(`Using claude at ${CLAUDE_BIN} · ${sessions.size} sessions found`);
+      resolve();
+    });
   });
-})();
+}
+
+module.exports = { start, stopHosts, PORT };
+
+// `node server.js` runs standalone; the desktop app requires this file and calls start().
+if (require.main === module) {
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  start().catch(e => { console.error(e.message); process.exit(1); });
+}

@@ -42,6 +42,8 @@ const state = {
   perms: new Map(),
   draft: '',
   dirs: [],
+  temporary: false,   // new-chat toggle
+  attachments: [],    // { id, name, size, path, uploading, error, preview }
   home: '',
 };
 
@@ -137,7 +139,7 @@ function renderSidebar() {
     const st = s.hosted ? s.hosted.status : s.terminal ? s.terminal.status : null;
     const where = s.hosted ? 'here' : s.terminal ? 'terminal' : '';
     const dot = st ? `<span class="dot ${st === 'busy' || st === 'starting' ? 'busy' : 'idle'}" title="${esc(where)} · ${esc(st)}"></span>` : '';
-    const sub = [mode === 'folder' ? '' : base(s.cwd), where && (st === 'busy' ? `working in ${where}` : `open in ${where}`), ago(s.mtime)].filter(Boolean).join(' · ');
+    const sub = s.hosted && s.hosted.temporary ? ['temporary · not saved', ago(s.mtime)].join(' · ') : [mode === 'folder' ? '' : base(s.cwd), where && (st === 'busy' ? `working in ${where}` : `open in ${where}`), ago(s.mtime)].filter(Boolean).join(' · ');
     return `<li class="sess-li" data-id="${s.id}"><a class="sess${s.id === state.current ? ' active' : ''}" href="#/s/${s.id}"><span class="txt"><span class="t">${esc(s.title)}</span><span class="sub">${esc(sub)}</span></span>${dot}</a><button type="button" class="icon-btn xs sess-more" aria-label="More options for ${esc(s.title)}" title="More"><svg viewBox="0 0 16 16" width="15" height="15"><circle cx="3.5" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="12.5" cy="8" r="1.3" fill="currentColor"/></svg></button></li>`;
   };
   $('#live-section').hidden = !live.length;
@@ -271,10 +273,17 @@ function renderChrome() {
   const s = currentSession();
   const main = $('#main');
   main.classList.toggle('new', !state.current);
+  main.classList.toggle('temp', !state.current ? state.temporary : !!(currentSession()?.hosted?.temporary));
+  $('#temp-btn').setAttribute('aria-pressed', String(state.temporary));
   if (!state.current) {
-    document.title = 'Claude Hub';
+    document.title = state.temporary ? 'Temporary chat · Claude Hub' : 'Claude Hub';
     $('#banner').hidden = true;
-    $('#input').placeholder = 'How can I help you today?';
+    const h = new Date().getHours();
+    $('#greeting').textContent = state.temporary ? 'Temporary chat' : h < 5 ? 'Up late?' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
+    $('#greet-sub').textContent = state.temporary
+      ? "This chat won't be saved to your history. It ends when you disconnect it or after 30 idle minutes."
+      : 'Pick a session on the left, or start a new one in any folder.';
+    $('#input').placeholder = state.temporary ? 'Ask anything. This chat won\'t be saved' : 'How can I help you today?';
     updateSend();
     return;
   }
@@ -285,16 +294,27 @@ function renderChrome() {
   const hostSt = state.hostStatus && state.hostStatus !== 'exited' ? state.hostStatus : null;
   $('#release-btn').hidden = !hostSt;
   const pill = $('#status-pill');
-  if (hostSt) {
+  const temp = !!(s && s.hosted && s.hosted.temporary) || state.tempEnded;
+  if (temp) {
     pill.hidden = false;
+    pill.className = 'pill temp-pill';
+    pill.innerHTML = state.tempEnded ? 'Temporary · ended' : `<span class="dot ${hostSt === 'idle' ? 'idle' : 'busy'}"></span>Temporary · not saved`;
+  } else if (hostSt) {
+    pill.hidden = false;
+    pill.className = 'pill';
     pill.innerHTML = `<span class="dot ${hostSt === 'idle' ? 'idle' : 'busy'}"></span>Running here · ${hostSt === 'idle' ? 'ready' : 'working'}`;
   } else if (s && s.terminal) {
     pill.hidden = false;
+    pill.className = 'pill';
     pill.innerHTML = `<span class="dot ${s.terminal.status === 'busy' ? 'busy' : 'idle'}"></span>Terminal · ${s.terminal.status === 'busy' ? 'working' : 'idle'}`;
   } else pill.hidden = true;
 
+  $('#resume-btn').hidden = !s || temp;
   const banner = $('#banner');
-  if (s && s.terminal && !hostSt) {
+  if (state.tempEnded) {
+    banner.hidden = false;
+    banner.innerHTML = '<span>This temporary chat has ended and was not saved. <a href="#/new">Start a new chat</a></span>';
+  } else if (s && s.terminal && !hostSt) {
     banner.hidden = false;
     banner.innerHTML = `<span class="dot ${s.terminal.status === 'busy' ? 'busy' : 'idle'}"></span><span>Open in a terminal (pid ${s.terminal.pid}) — you're watching it live. Sending a message lets you take it over or fork it.</span>`;
   } else banner.hidden = true;
@@ -311,10 +331,12 @@ function isBusy() {
 
 function updateSend() {
   const btn = $('#send');
-  const hasText = $('#input').value.trim().length > 0;
+  const uploading = state.attachments.some(a => a.uploading);
+  const hasText = $('#input').value.trim().length > 0 || state.attachments.some(a => a.path);
   const canStop = state.current && (state.hostStatus === 'busy' || state.hostStatus === 'starting');
   btn.classList.toggle('stop', !hasText && !!canStop);
-  btn.disabled = !hasText && !canStop;
+  btn.disabled = (!hasText && !canStop) || (hasText && uploading);
+  btn.title = uploading ? 'Waiting for uploads to finish' : '';
   btn.setAttribute('aria-label', btn.classList.contains('stop') ? 'Stop' : 'Send');
 }
 
@@ -447,13 +469,10 @@ function renderItem(it) {
   switch (it.kind) {
     case 'user': {
       closeTurn();
-      const el = document.createElement('div');
-      el.className = 'msg user';
-      el.innerHTML = `<div class="user-bubble"><span class="avatar">D</span><div><div class="user-text"></div></div></div>`;
+      const el = userBubble(it.text);
       const txt = $('.user-text', el);
-      txt.textContent = it.text;
       if (it.images) txt.insertAdjacentHTML('afterend', `<span class="img-note">${it.images} image${it.images > 1 ? 's' : ''}</span>`);
-      if (it.text.split('\n').length > 9 || it.text.length > 700) {
+      if (txt.textContent.split('\n').length > 9 || txt.textContent.length > 700) {
         txt.classList.add('clamped');
         const b = document.createElement('button');
         b.className = 'more-btn'; b.type = 'button'; b.textContent = 'Show more';
@@ -658,6 +677,18 @@ function connect(sessionId) {
   es.addEventListener('host', e => { if (es === state.es) onHost(JSON.parse(e.data)); });
 }
 
+// System notification when a reply finishes while the window isn't in front.
+function notifyDone(evt) {
+  if (!('Notification' in window) || document.hasFocus()) return;
+  const s = currentSession();
+  const show = () => {
+    const n = new Notification(s ? s.title : 'Claude Hub', { body: evt.isError ? 'Claude hit an error' : 'Claude finished replying', icon: '/favicon.svg', silent: false });
+    n.onclick = () => { window.focus(); n.close(); };
+  };
+  if (Notification.permission === 'granted') show();
+  else if (Notification.permission !== 'denied') Notification.requestPermission().then(p => { if (p === 'granted') show(); });
+}
+
 let draftTimer = null;
 function onHost(evt) {
   switch (evt.t) {
@@ -688,6 +719,7 @@ function onHost(evt) {
       break;
     case 'result':
       if (evt.isError && evt.text) toast(evt.text, true);
+      notifyDone(evt);
       // drop a leftover draft if the transcript never delivered it
       setTimeout(() => { if (state.draft && state.hostStatus !== 'busy') { state.draft = ''; renderWorking(); } }, 6000);
       break;
@@ -786,6 +818,8 @@ function renderPerms() {
 async function loadSession(id, keepScroll) {
   const data = await api(`/sessions/${id}/items`);
   if (state.current !== id) return;
+  state.tempEnded = !!data.gone && !currentSession();
+  if (state.tempEnded) renderChrome();
   state.items = data.items;
   state.start = data.start;
   renderAll();
@@ -796,6 +830,7 @@ async function openSession(id) {
   const changed = state.current !== id;
   state.current = id;
   if (changed) {
+    state.tempEnded = false;
     state.items = []; state.start = 0; state.draft = ''; state.activity = '';
     state.perms.clear(); renderPerms();
     const s = currentSession();
@@ -824,8 +859,8 @@ function showNew() {
   renderPerms();
   resetRender();
   connect(null);
-  const h = new Date().getHours();
-  $('#greeting').textContent = h < 5 ? 'Up late?' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
+  state.temporary = false;
+  state.tempEnded = false;
   setSelect('#perm-mode', pref.get('perm', 'manual'));
   setSelect('#model', pref.get('model', ''));
   renderChrome();
@@ -858,11 +893,37 @@ function chooseMode() {
   });
 }
 
-function optimisticUser(text) {
+const ATTACH_RE = /^\[Attached file: (.+)\]$/gm;
+const IMG_EXT = /\.(png|jpe?g|gif|webp|svg)$/i;
+const fileUrl = p => `/api/upload-file?token=${TOKEN}&path=${encodeURIComponent(p)}`;
+const fmtSize = n => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1048576).toFixed(1)} MB`);
+const FILE_ICON = '<svg viewBox="0 0 16 16" width="16" height="16"><path d="M4 1.8h5l3 3v9.4H4z M9 1.8v3h3" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>';
+
+// A user message bubble; "[Attached file: …]" lines become file chips / image thumbnails.
+function userBubble(text) {
+  const files = [...String(text).matchAll(ATTACH_RE)].map(m => m[1]);
+  const body = String(text).replace(ATTACH_RE, '').trim();
   const el = document.createElement('div');
-  el.className = 'msg user optimistic';
-  el.innerHTML = '<div class="user-bubble"><span class="avatar">D</span><div class="user-text"></div></div>';
-  $('.user-text', el).textContent = text;
+  el.className = 'msg user';
+  el.innerHTML = '<div class="user-bubble"><span class="avatar">D</span><div class="user-col"><div class="user-files"></div><div class="user-text"></div></div></div>';
+  $('.user-text', el).textContent = body;
+  if (!body) $('.user-text', el).hidden = true;
+  const box = $('.user-files', el);
+  for (const p of files) {
+    const name = p.split('/').pop();
+    if (IMG_EXT.test(p) && p.includes('/claude-hub/uploads/')) {
+      box.insertAdjacentHTML('beforeend', `<a class="file-thumb" href="${fileUrl(p)}" target="_blank" rel="noopener" title="${esc(name)}"><img src="${fileUrl(p)}" alt="${esc(name)}" loading="lazy"></a>`);
+    } else {
+      box.insertAdjacentHTML('beforeend', `<span class="file-chip" title="${esc(p)}">${FILE_ICON}<span>${esc(name)}</span></span>`);
+    }
+  }
+  if (!files.length) box.remove();
+  return el;
+}
+
+function optimisticUser(text) {
+  const el = userBubble(text);
+  el.classList.add('optimistic');
   $('#thread .empty-thread')?.remove();
   closeTurn();
   insertBeforeTail(el);
@@ -871,7 +932,10 @@ function optimisticUser(text) {
 
 $('#composer').addEventListener('submit', async e => {
   e.preventDefault();
-  const text = input.value.trim();
+  if (state.attachments.some(a => a.uploading)) { toast('Wait for the files to finish uploading'); return; }
+  const files = state.attachments.filter(a => a.path);
+  let text = input.value.trim();
+  if (files.length) text = (text || 'Please look at the attached file' + (files.length > 1 ? 's.' : '.')) + '\n\n' + files.map(a => `[Attached file: ${a.path}]`).join('\n');
   const permissionMode = $('#perm-mode').value;
   const model = $('#model').value;
   if (!text) {
@@ -883,9 +947,9 @@ $('#composer').addEventListener('submit', async e => {
   if (!state.current) {
     const cwd = $('#cwd-input').value.trim() || $('#cwd-input').placeholder;
     try {
-      const r = await api('/new', { body: { cwd, text, permissionMode, model } });
+      const r = await api('/new', { body: { cwd, text, permissionMode, model, temporary: state.temporary } });
       pref.set('cwd', cwd);
-      input.value = ''; autosize(); updateSend();
+      input.value = ''; clearAttachments(); autosize(); updateSend();
       location.hash = `#/s/${r.id}`;
       setTimeout(() => optimisticUser(text), 50);
     } catch (err) { toast(err.message, true); }
@@ -893,7 +957,8 @@ $('#composer').addEventListener('submit', async e => {
   }
   const id = state.current;
   const send = async mode => api(`/sessions/${id}/send`, { body: { text, mode, permissionMode, model } });
-  input.value = ''; autosize();
+  const keptFiles = state.attachments.slice();
+  input.value = ''; clearAttachments(); autosize();
   optimisticUser(text);
   state.hostStatus = state.hostStatus === 'idle' ? 'busy' : state.hostStatus || 'starting';
   renderChrome();
@@ -905,7 +970,7 @@ $('#composer').addEventListener('submit', async e => {
       const mode = await chooseMode();
       if (!mode) {
         document.querySelectorAll('.msg.user.optimistic').forEach(x => x.remove());
-        input.value = text; autosize();
+        input.value = text.replace(ATTACH_RE, '').trim(); state.attachments = keptFiles; renderAttachments(); autosize();
         state.hostStatus = null; renderChrome();
         return;
       }
@@ -916,7 +981,7 @@ $('#composer').addEventListener('submit', async e => {
   } catch (err) {
     toast(err.message, true);
     document.querySelectorAll('.msg.user.optimistic').forEach(x => x.remove());
-    input.value = text; autosize();
+    input.value = text.replace(ATTACH_RE, '').trim(); state.attachments = keptFiles; renderAttachments(); autosize();
     state.hostStatus = null; renderChrome();
   }
   updateSend();
@@ -1059,7 +1124,9 @@ async function deleteChat(id) {
   if (s.terminal) { toast('This chat is open in a terminal. Close it there first.', true); return; }
   const ok = await confirmBox({
     title: 'Delete chat?',
-    body: `"${s.title}" will be moved to your Trash.${s.hosted ? ' It is running here and will be stopped.' : ''}`,
+    body: s.hosted && s.hosted.temporary
+      ? `"${s.title}" is a temporary chat. It will end and can't be recovered.`
+      : `"${s.title}" will be moved to your Trash.${s.hosted ? ' It is running here and will be stopped.' : ''}`,
     ok: 'Delete', danger: true,
   });
   if (!ok) return;
@@ -1068,7 +1135,7 @@ async function deleteChat(id) {
     state.sessions = state.sessions.filter(x => x.id !== id);
     renderSidebar();
     if (state.current === id) location.hash = '#/new';
-    toast(r.trashed ? 'Moved to Trash' : 'Chat deleted');
+    toast(r.trashed ? 'Moved to Trash' : s.hosted && s.hosted.temporary ? 'Temporary chat ended' : 'Chat deleted');
   } catch (e) { toast(e.message, true); }
 }
 
@@ -1085,6 +1152,84 @@ $('#nav').addEventListener('contextmenu', e => {
   if (!li) return;
   e.preventDefault();
   chatMenu(li.querySelector('.sess-more'), li.dataset.id);
+});
+
+// ------------------------------------------------------------------ temporary chat toggle
+
+$('#temp-btn').onclick = () => {
+  state.temporary = !state.temporary;
+  renderChrome();
+  $('#input').focus();
+};
+
+// ------------------------------------------------------------------ file attachments
+
+function renderAttachments() {
+  const tray = $('#attach-tray');
+  tray.hidden = !state.attachments.length;
+  tray.innerHTML = '';
+  for (const a of state.attachments) {
+    const el = document.createElement('div');
+    el.className = 'att' + (a.uploading ? ' uploading' : '') + (a.error ? ' failed' : '');
+    el.title = a.error || a.path || a.name;
+    el.innerHTML = (a.preview ? `<img src="${a.preview}" alt="">` : `<span class="att-ico">${FILE_ICON}</span>`) +
+      `<span class="att-meta"><span class="att-name">${esc(a.name)}</span><span class="att-sub">${a.error ? esc(a.error) : a.uploading ? 'Uploading…' : fmtSize(a.size)}</span></span>` +
+      '<button type="button" class="att-x" aria-label="Remove">✕</button>';
+    $('.att-x', el).onclick = () => {
+      state.attachments = state.attachments.filter(x => x !== a);
+      if (a.preview) URL.revokeObjectURL(a.preview);
+      renderAttachments();
+    };
+    tray.appendChild(el);
+  }
+  updateSend();
+}
+
+function clearAttachments() {
+  for (const a of state.attachments) if (a.preview) URL.revokeObjectURL(a.preview);
+  state.attachments = [];
+  renderAttachments();
+}
+
+async function addFiles(fileList) {
+  for (const f of [...fileList]) {
+    if (f.size > 100 * 1024 * 1024) { toast(`${f.name} is larger than 100 MB`, true); continue; }
+    const a = { name: f.name || 'pasted-file', size: f.size, uploading: true, preview: f.type.startsWith('image/') ? URL.createObjectURL(f) : null };
+    state.attachments.push(a);
+    renderAttachments();
+    try {
+      const r = await fetch(`/api/upload?name=${encodeURIComponent(a.name)}`, { method: 'POST', headers: { 'x-hub-token': TOKEN, 'content-type': 'application/octet-stream' }, body: f });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || `Upload failed (${r.status})`);
+      a.path = d.path;
+    } catch (e) {
+      a.error = e.message;
+    }
+    a.uploading = false;
+    renderAttachments();
+  }
+}
+
+$('#attach-btn').onclick = () => $('#file-input').click();
+$('#file-input').onchange = e => { addFiles(e.target.files); e.target.value = ''; };
+input.addEventListener('paste', e => {
+  const files = e.clipboardData && e.clipboardData.files;
+  if (files && files.length) { e.preventDefault(); addFiles(files); }
+});
+
+// drag & drop anywhere over the chat area
+let dragDepth = 0;
+const hasFiles = e => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+$('#main').addEventListener('dragenter', e => { if (!hasFiles(e)) return; e.preventDefault(); dragDepth++; $('#drop-overlay').hidden = false; });
+$('#main').addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+$('#main').addEventListener('dragleave', () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) $('#drop-overlay').hidden = true; });
+$('#main').addEventListener('drop', e => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  $('#drop-overlay').hidden = true;
+  addFiles(e.dataTransfer.files);
+  input.focus();
 });
 
 // ------------------------------------------------------------------ boot

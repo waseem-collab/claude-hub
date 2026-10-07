@@ -1,0 +1,41 @@
+{
+  "name": "claude-hub",
+  "productName": "Claude Hub",
+  "version": "1.0.0",
+  "description": "All your local Claude Code sessions in one window, styled like claude.ai",
+  "main": "electron/main.js",
+  "author": "waseem-collab",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "server": "node server.js",
+    "build": "electron-builder --linux dir",
+    "install-app": "npm run build && ./install-desktop.sh"
+  },
+  "build": {
+    "appId": "ai.visionify.claude-hub",
+    "productName": "Claude Hub",
+    "asar": false,
+    "files": [
+      "server.js",
+      "public/**",
+      "electron/**",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "linux": {
+      "target": [
+        "dir"
+      ],
+      "category": "Development",
+      "icon": "electron/icons",
+      "executableName": "claude-hub"
+    }
+  },
+  "devDependencies": {
+    "electron": "^44.6.0",
+    "electron-builder": "^26.15.3"
+  }
+}
