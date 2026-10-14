@@ -2,25 +2,26 @@
 
 One window for every Claude Code session on this machine, styled like claude.ai.
 
-## Desktop app
+## Install / open
 
 ```bash
-npm install
-npm run install-app     # builds the app and adds "Claude Hub" to your app launcher
+./run.sh
 ```
 
-Open **Claude Hub** from the launcher; there's no terminal step. The app runs its own server
-and stops it when you quit. It opens at login by default (toggle: menu bar → Claude Hub → Open at
-login; press Alt to show the menu). When a reply finishes while the window is in the background,
-you get a desktop notification.
+The first time, this installs dependencies, builds the desktop app and adds **Claude Hub** to
+your app launcher, then opens it. Afterwards it just opens the app, rebuilding first if you've
+changed the code. You can also open it from the launcher; there's no terminal step.
 
-After changing the code, run `npm run install-app` again to update the installed app.
+The app runs its own server and stops it when you quit. It opens at login by default (press Alt
+for the menu → Claude Hub → Open at login). When a reply finishes while the window is in the
+background, you get a desktop notification.
 
-## Run without installing
+Other ways to run it:
 
 ```bash
-npm start           # desktop window straight from the source folder
-node server.js      # browser version at http://localhost:4777  (or ./run.sh)
+./run.sh --browser  # browser version (server + app-style browser window)
+npm start           # desktop window straight from the source folder, no install
+node server.js      # just the server, at http://localhost:4777
 ```
 
 Needs Node 18+ and the `claude` CLI.

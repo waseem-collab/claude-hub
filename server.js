@@ -34,6 +34,15 @@ function saveTitles() {
   fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(TITLES_FILE, JSON.stringify(titles, null, 2), { mode: 0o600 });
 }
+
+// Pinned chats, newest pin first.
+const PINS_FILE = path.join(CONFIG_DIR, 'pins.json');
+let pins = [];
+try { pins = JSON.parse(fs.readFileSync(PINS_FILE, 'utf8')); if (!Array.isArray(pins)) pins = []; } catch { pins = []; }
+function savePins() {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(PINS_FILE, JSON.stringify(pins), { mode: 0o600 });
+}
 // The page token is kept on disk so restarting the server doesn't break open pages.
 const TOKEN = (() => {
   const file = path.join(CONFIG_DIR, 'token');
@@ -336,6 +345,7 @@ function sessionList() {
     list.push({
       id,
       title: (host && host.temp && (titles[id] || host.title)) || titles[id] || m.title || (term && term.name) || 'New conversation',
+      pinned: pins.includes(id) ? pins.length - pins.indexOf(id) : 0,
       cwd: m.cwd || (term && term.cwd) || (host && host.cwd) || null,
       mtime: m.mtimeMs || (term && term.startedAt) || Date.now(),
       permissionMode: m.permissionMode,
@@ -622,7 +632,7 @@ function publish(id, evt) {
 let lastListSig = '';
 function broadcastSessions(force) {
   const list = sessionList();
-  const sig = JSON.stringify(list.map(s => [s.id, s.title, s.mtime, s.terminal && s.terminal.status, s.hosted && s.hosted.status]));
+  const sig = JSON.stringify(list.map(s => [s.id, s.title, s.mtime, s.pinned, s.terminal && s.terminal.status, s.hosted && s.hosted.status]));
   if (!force && sig === lastListSig) return;
   lastListSig = sig;
   for (const c of clients) sse(c.res, 'sessions', list);
@@ -870,6 +880,15 @@ async function api(req, res, url) {
       return json(res, 200, { ok: true });
     }
 
+    if (method === 'POST' && action === 'pin') {
+      const on = !!(await body(req)).pinned;
+      pins = pins.filter(x => x !== id);
+      if (on) pins.unshift(id);
+      savePins();
+      broadcastSessions(true);
+      return json(res, 200, { ok: true, pinned: on });
+    }
+
     if (method === 'POST' && action === 'rename') {
       const title = String((await body(req)).title || '').replace(/\s+/g, ' ').trim().slice(0, 200);
       const th = hosts.get(id);
@@ -907,6 +926,7 @@ async function api(req, res, url) {
       sessions.delete(id);
       transcripts.delete(id);
       if (titles[id]) { delete titles[id]; saveTitles(); }
+      if (pins.includes(id)) { pins = pins.filter(x => x !== id); savePins(); }
       broadcastSessions(true);
       return json(res, 200, { ok: true, trashed });
     }

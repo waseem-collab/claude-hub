@@ -82,7 +82,23 @@ function toast(msg, err) {
 }
 
 function copy(text, label = 'Copied') {
-  navigator.clipboard.writeText(text).then(() => toast(label), () => toast('Copy failed', true));
+  // Fallback for when the async clipboard API is unavailable or refused.
+  const legacy = () => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
+    ta.remove();
+    return ok;
+  };
+  const done = ok => toast(ok ? label : 'Copy failed', !ok);
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => done(true), () => done(legacy()));
+  } else done(legacy());
 }
 
 function ago(ms) {
@@ -132,9 +148,9 @@ function renderSidebar() {
   const match = s => !q || (s.title || '').toLowerCase().includes(q) || (s.cwd || '').toLowerCase().includes(q);
   const isLive = s => !!(s.terminal || (s.hosted && s.hosted.status !== 'exited'));
   const mode = $('#group-by').value;
-  // Status grouping covers live sessions itself, so the pinned "Live now" section is dropped there.
-  const live = mode === 'status' ? [] : state.sessions.filter(s => isLive(s) && match(s));
-  const recent = state.sessions.filter(s => !live.includes(s) && match(s)).slice(0, 400);
+  // Pinned chats get their own section on top and are left out of the groups below.
+  const pinned = state.sessions.filter(s => s.pinned && match(s)).sort((a, b) => b.pinned - a.pinned);
+  const recent = state.sessions.filter(s => !s.pinned && match(s)).slice(0, 400);
   const row = s => {
     const st = s.hosted ? s.hosted.status : s.terminal ? s.terminal.status : null;
     const where = s.hosted ? 'here' : s.terminal ? 'terminal' : '';
@@ -142,11 +158,21 @@ function renderSidebar() {
     const sub = s.hosted && s.hosted.temporary ? ['temporary · not saved', ago(s.mtime)].join(' · ') : [mode === 'folder' ? '' : base(s.cwd), where && (st === 'busy' ? `working in ${where}` : `open in ${where}`), ago(s.mtime)].filter(Boolean).join(' · ');
     return `<li class="sess-li" data-id="${s.id}"><a class="sess${s.id === state.current ? ' active' : ''}" href="#/s/${s.id}"><span class="txt"><span class="t">${esc(s.title)}</span><span class="sub">${esc(sub)}</span></span>${dot}</a><button type="button" class="icon-btn xs sess-more" aria-label="More options for ${esc(s.title)}" title="More"><svg viewBox="0 0 16 16" width="15" height="15"><circle cx="3.5" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="12.5" cy="8" r="1.3" fill="currentColor"/></svg></button></li>`;
   };
-  $('#live-section').hidden = !live.length;
-  $('#live-list').innerHTML = live.map(row).join('');
+  $('#pinned-section').hidden = !pinned.length;
+  $('#pinned-list').innerHTML = pinned.map(row).join('');
   const box = $('#chat-groups');
   const groups = groupSessions(recent, mode);
-  const collapsed = groupCollapsed(mode);
+  const expanded = expandedGroups(mode);
+  // Opening a chat leaves only its group open (all groups close for a pinned chat).
+  if (state.focusGroupFor && state.focusGroupFor === state.current) {
+    const own = groups.find(g => g.items.some(s => s.id === state.current));
+    const isPinned = pinned.some(s => s.id === state.current);
+    if (own || isPinned) {
+      expanded.clear();
+      if (own) expanded.add(own.key);
+      state.focusGroupFor = null;
+    }
+  }
   $('#collapse-all').hidden = mode === 'none' || groups.length < 2;
   if (!recent.length) {
     box.innerHTML = `<ul><li class="sb-empty">${q ? 'No matches' : 'No sessions yet'}</li></ul>`;
@@ -155,7 +181,7 @@ function renderSidebar() {
   } else {
     box.innerHTML = groups.map(g => {
       // while searching, show every match regardless of collapsed groups
-      const closed = !q && collapsed.has(g.key);
+      const closed = !q && !expanded.has(g.key);
       const add = g.cwd ? `<button type="button" class="icon-btn xs g-new" data-cwd="${esc(g.cwd)}" title="New chat in ${esc(home(g.cwd))}" aria-label="New chat in this folder"><svg viewBox="0 0 16 16" width="12" height="12"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>` : '';
       return `<div class="sb-group${closed ? ' closed' : ''}" data-key="${esc(g.key)}">
         <div class="g-head"><button type="button" class="g-toggle" title="${esc(g.title || g.label)}" aria-expanded="${!closed}">${CHEV}<span class="g-label">${esc(g.label)}</span>${g.hint ? `<span class="g-hint">${esc(g.hint)}</span>` : ''}<span class="g-count">${g.items.length}</span></button>${add}</div>
@@ -227,11 +253,9 @@ function groupSessions(list, mode) {
   return groups;
 }
 
-function groupCollapsed(mode) {
-  try { return new Set(JSON.parse(pref.get('collapsed-' + mode, '[]'))); } catch { return new Set(); }
-}
-
-function setGroupCollapsed(mode, set) { pref.set('collapsed-' + mode, JSON.stringify([...set])); }
+// Groups start closed every time the app opens; the ones you open stay open until it's closed.
+const openGroups = {};
+const expandedGroups = mode => (openGroups[mode] ||= new Set());
 
 $('#group-by').value = ['none', 'date', 'folder', 'status', 'model'].includes(pref.get('group', 'date')) ? pref.get('group', 'date') : 'date';
 $('#group-by').addEventListener('change', e => { pref.set('group', e.target.value); renderSidebar(); });
@@ -248,20 +272,17 @@ $('#chat-groups').addEventListener('click', e => {
   if (!t) return;
   const mode = $('#group-by').value;
   const key = t.closest('.sb-group').dataset.key;
-  const set = groupCollapsed(mode);
+  const set = expandedGroups(mode);
   set.has(key) ? set.delete(key) : set.add(key);
-  setGroupCollapsed(mode, set);
   renderSidebar();
 });
 
 $('#collapse-all').onclick = () => {
   const mode = $('#group-by').value;
   const keys = [...document.querySelectorAll('#chat-groups .sb-group')].map(g => g.dataset.key);
-  const set = groupCollapsed(mode);
-  // collapse everything except the active chat's group, or expand all if already collapsed
-  const activeKey = document.querySelector('#chat-groups .sess.active')?.closest('.sb-group')?.dataset.key;
-  const allClosed = keys.every(k => set.has(k) || k === activeKey);
-  setGroupCollapsed(mode, new Set(allClosed ? [] : keys.filter(k => k !== activeKey)));
+  const set = expandedGroups(mode);
+  // close everything, or open everything if it's all closed already
+  if (set.size) set.clear(); else keys.forEach(k => set.add(k));
   renderSidebar();
 };
 
@@ -831,6 +852,7 @@ async function openSession(id) {
   state.current = id;
   if (changed) {
     state.tempEnded = false;
+    state.focusGroupFor = id;
     state.items = []; state.start = 0; state.draft = ''; state.activity = '';
     state.perms.clear(); renderPerms();
     const s = currentSession();
@@ -1034,6 +1056,7 @@ setInterval(() => { if (!$('#search').matches(':focus')) renderSidebar(); }, 600
 
 // ------------------------------------------------------------------ rename / delete chats
 
+const ICON_PIN = '<svg viewBox="0 0 16 16" width="15" height="15"><path d="M10.2 2.2l3.6 3.6-2.3 1.1-2.6 2.6.4 2.9-1.2 1.2-2.6-2.6L2.8 13.7M5.5 8.4L3 5.9l1.2-1.2 2.9.4 2.6-2.6z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" stroke-linecap="round"/></svg>';
 const ICON_PEN = '<svg viewBox="0 0 16 16" width="15" height="15"><path d="M10.5 2.5l3 3L6 13H3v-3z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
 const ICON_TRASH = '<svg viewBox="0 0 20 20" width="15" height="15"><path d="M4.5 6h11M8 6V4.5h4V6M6 6l.7 10h6.6L14 6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
@@ -1042,12 +1065,23 @@ function chatMenu(anchor, id) {
   Dropdown.open({
     anchor, align: 'end',
     items: [
+      { value: 'pin', label: state.sessions.find(x => x.id === id)?.pinned ? 'Unpin' : 'Pin', icon: ICON_PIN },
       { value: 'rename', label: 'Rename', icon: ICON_PEN },
       { value: 'delete', label: 'Delete', icon: ICON_TRASH, danger: true },
     ],
-    onPick: v => (v === 'rename' ? renameInSidebar(id) : deleteChat(id)),
+    onPick: v => (v === 'pin' ? togglePin(id) : v === 'rename' ? renameInSidebar(id) : deleteChat(id)),
     onClose: () => anchor.classList.remove('open'),
   });
+}
+
+async function togglePin(id) {
+  const s = state.sessions.find(x => x.id === id);
+  if (!s) return;
+  const on = !s.pinned;
+  s.pinned = on ? Date.now() : 0; // show it right away; the server broadcast confirms the order
+  renderSidebar();
+  try { await api(`/sessions/${id}/pin`, { body: { pinned: on } }); toast(on ? 'Pinned' : 'Unpinned'); }
+  catch (e) { toast(e.message, true); }
 }
 
 // Inline text box in place of `el`; resolves with the new text, or null if cancelled.

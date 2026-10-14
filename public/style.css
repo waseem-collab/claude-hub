@@ -348,8 +348,6 @@ dialog p { margin: 0 0 16px; color: var(--muted); font-size: 13.5px; }
 
 /* ---------- apps ---------- */
 .sb-actions { display: flex; gap: 2px; }
-.apps-chip { background: transparent; font: 12.5px var(--sans); cursor: pointer; }
-.apps-chip.on { color: var(--accent); }
 dialog.wide { max-width: 560px; padding: 0; max-height: min(86vh, 760px); overflow: hidden; display: none; flex-direction: column; }
 dialog.wide[open] { display: flex; }
 .cd-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; padding: 20px 20px 12px 24px; border-bottom: 0.5px solid var(--border); }

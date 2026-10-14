@@ -6,9 +6,6 @@ const conn = { list: [] };
 
 async function loadConnections() {
   try { conn.list = (await api('/connections')).connections; } catch (e) { toast(e.message, true); }
-  const n = conn.list.length;
-  $('#apps-count').textContent = n ? `${n} app${n > 1 ? 's' : ''}` : 'Apps';
-  $('#apps-chip').classList.toggle('on', n > 0);
 }
 
 function openConnections() {
@@ -17,7 +14,6 @@ function openConnections() {
 }
 
 $('#conn-btn').onclick = openConnections;
-$('#apps-chip').onclick = openConnections;
 $('#cd-close').onclick = () => $('#conn-dialog').close();
 $('#conn-dialog').addEventListener('click', e => { if (e.target === e.currentTarget) e.currentTarget.close(); });
 

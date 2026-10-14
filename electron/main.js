@@ -86,8 +86,10 @@ function createWindow() {
   win.webContents.on('will-navigate', (e, url) => {
     if (!url.startsWith(URL_BASE)) { e.preventDefault(); if (/^https?:/.test(url)) shell.openExternal(url); }
   });
-  // Allow desktop notifications from the page; nothing else.
-  win.webContents.session.setPermissionRequestHandler((_wc, permission, cb) => cb(permission === 'notifications'));
+  // The page may show notifications and write to the clipboard (Copy buttons); nothing else.
+  const ALLOWED = new Set(['notifications', 'clipboard-sanitized-write']);
+  win.webContents.session.setPermissionRequestHandler((_wc, permission, cb) => cb(ALLOWED.has(permission)));
+  win.webContents.session.setPermissionCheckHandler((_wc, permission) => ALLOWED.has(permission));
 }
 
 // ------------------------------------------------------------------ open at login (XDG autostart)
