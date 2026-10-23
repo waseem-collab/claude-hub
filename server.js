@@ -95,6 +95,46 @@ function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
+// ---------------------------------------------------------------- token pricing
+
+// USD per million tokens: [input, output, cache read]. Cache writes are 1.25x input (5-minute
+// cache) and 2x input (1-hour cache). First-party API list prices; on a Claude subscription
+// these are "API-equivalent" figures, not what you're billed.
+const PRICES = [
+  ['claude-fable-5-1', 10, 50, 0.25], ['claude-mythos-5-1', 10, 50, 0.25],
+  ['claude-fable-5', 10, 50, 1.0], ['claude-mythos-5', 10, 50, 1.0],
+  ['claude-opus-5-5', 4, 20, 0.20], ['claude-opus-5', 5, 25, 0.5],
+  ['claude-opus-4-8', 5, 25, 0.5], ['claude-opus-4-7', 5, 25, 0.5], ['claude-opus-4-6', 5, 25, 0.5], ['claude-opus-4-5', 5, 25, 0.5],
+  ['claude-opus-4', 15, 75, 1.5], ['claude-3-opus', 15, 75, 1.5],
+  ['claude-sonnet-5-5', 2, 10, 0.20], ['claude-sonnet-5', 2, 10, 0.2],
+  ['claude-sonnet-4', 3, 15, 0.3], ['claude-3-7-sonnet', 3, 15, 0.3], ['claude-3-5-sonnet', 3, 15, 0.3],
+  ['claude-haiku-4-5', 1, 5, 0.1], ['claude-3-5-haiku', 0.8, 4, 0.08], ['claude-3-haiku', 0.25, 1.25, 0.03],
+];
+
+function priceFor(model) {
+  const m = String(model || '').toLowerCase();
+  for (const row of PRICES) if (m === row[0] || m.startsWith(row[0] + '-') || m.startsWith(row[0] + '[')) return row;
+  if (m.includes('fable') || m.includes('mythos')) return PRICES[0];
+  if (m.includes('opus')) return PRICES[5];
+  if (m.includes('sonnet')) return PRICES[12];
+  if (m.includes('haiku')) return PRICES[17];
+  return null;
+}
+
+// Returns { cost, tokens: { input, cacheWrite, cacheRead, output } } or null for unknown models.
+function costOf(model, u) {
+  const p = priceFor(model);
+  if (!p || !u) return null;
+  const [, inp, out, read] = p;
+  const cw = u.cache_creation || {};
+  const w1h = cw.ephemeral_1h_input_tokens || 0;
+  const w5m = cw.ephemeral_5m_input_tokens != null ? cw.ephemeral_5m_input_tokens : Math.max(0, (u.cache_creation_input_tokens || 0) - w1h);
+  const tokens = { input: u.input_tokens || 0, cacheWrite: w5m + w1h, cacheRead: u.cache_read_input_tokens || 0, output: u.output_tokens || 0 };
+  const fast = u.speed === 'fast' ? 2 : 1;
+  const cost = fast * (tokens.input * inp + w5m * inp * 1.25 + w1h * inp * 2 + tokens.cacheRead * read + tokens.output * out) / 1e6;
+  return { cost, tokens };
+}
+
 // ---------------------------------------------------------------- transcript parsing
 
 function tagValue(s, tag) {
@@ -158,6 +198,12 @@ function entryToItems(o) {
       else if (b.type === 'tool_use') items.push({ ...base, kind: 'tool', id: b.id, name: b.name, input: shrinkInput(b.input) });
     }
     if (o.isApiErrorMessage) items.push({ ...base, kind: 'note', level: 'error', text: 'API error' });
+    // Token usage for the turn's cost; a reply is split over several entries sharing one message id.
+    const msg = o.message || {};
+    if (msg.usage && msg.id && msg.model && msg.model !== '<synthetic>') {
+      const c2 = costOf(msg.model, msg.usage);
+      if (c2) items.push({ ...base, kind: 'usage', msg: msg.id, model: msg.model, cost: c2.cost, tokens: c2.tokens });
+    }
   } else if (o.type === 'attachment' && o.attachment) {
     const a = o.attachment;
     if (a.type === 'queued_command' && typeof a.prompt === 'string') pushUserString(a.prompt);
@@ -263,11 +309,12 @@ async function readMeta(id, file, st, prev) {
   if (!head) {
     const objs = parseLines(await readChunk(file, 0, Math.min(HEAD, st.size)), false);
     const withCwd = objs.find(o => o.cwd);
-    head = { cwd: withCwd ? withCwd.cwd : null, firstPrompt: firstHumanPrompt(objs), headComplete: st.size > HEAD || !!firstHumanPrompt(objs) };
+    const firstTs = objs.find(o => o.timestamp);
+    head = { cwd: withCwd ? withCwd.cwd : null, firstPrompt: firstHumanPrompt(objs), headComplete: st.size > HEAD || !!firstHumanPrompt(objs), created: firstTs ? Date.parse(firstTs.timestamp) : null };
     head.headTitle = null;
     for (const o of objs) if (o.type === 'ai-title' || o.type === 'custom-title' || o.type === 'summary') head.headTitle = o.customTitle || o.aiTitle || o.summary || head.headTitle;
   }
-  Object.assign(m, { cwd: head.cwd, firstPrompt: head.firstPrompt, headComplete: head.headComplete, headTitle: head.headTitle });
+  Object.assign(m, { cwd: head.cwd, firstPrompt: head.firstPrompt, headComplete: head.headComplete, headTitle: head.headTitle, created: head.created || (prev && prev.created) || st.birthtimeMs || st.mtimeMs });
 
   const tailStart = Math.max(0, st.size - TAIL);
   const tail = parseLines(await readChunk(file, tailStart, st.size - tailStart), tailStart > 0);
@@ -348,6 +395,7 @@ function sessionList() {
       pinned: pins.includes(id) ? pins.length - pins.indexOf(id) : 0,
       cwd: m.cwd || (term && term.cwd) || (host && host.cwd) || null,
       mtime: m.mtimeMs || (term && term.startedAt) || Date.now(),
+      created: m.created || (host && host.createdAt) || (term && term.startedAt) || m.mtimeMs || Date.now(),
       permissionMode: m.permissionMode,
       model: m.model,
       terminal: term ? { pid: term.pid, status: term.status, name: term.name } : null,
@@ -442,6 +490,7 @@ class Host {
     this.temp = !!temporary;
     this.items = [];
     this.title = '';
+    this.createdAt = Date.now();
     this.cwd = cwd;
     this.permissionMode = permissionMode || 'manual';
     this.model = model || null;

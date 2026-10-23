@@ -57,6 +57,27 @@ Claude.
 
 Changes apply from the next message. Stored in `~/.config/claude-hub/connections.json` (mode 600).
 
+## Google (local, read-only)
+
+`mcp/google.js` is a local connector that lets Claude Code read your Gmail and Google Calendar. It runs on
+this machine with no dependencies, uses read-only scopes (it can't send, delete or change anything), and
+keeps your OAuth client and tokens in `~/.config/claude-hub/` (mode 600). They're only ever sent to Google.
+
+One-time setup:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/), create a project and enable the
+   **Gmail API** and **Google Calendar API**.
+2. *APIs & Services → OAuth consent screen*: choose **Internal** if your Workspace allows it, otherwise
+   **External** and add yourself as a test user.
+3. *Credentials → Create credentials → OAuth client ID → Desktop app*, then **Download JSON** and save it as
+   `~/.config/claude-hub/google-credentials.json`.
+4. Sign in: `node mcp/google.js auth` (opens the browser). Check with `node mcp/google.js whoami`.
+5. Register it with Claude Code (once): `claude mcp add -s user google-local -- node <path>/mcp/google.js`
+
+Tools: `gmail_search`, `gmail_read_message`, `gmail_read_thread`, `calendar_list_events`, `google_whoami`.
+To disconnect, delete `~/.config/claude-hub/google-token.json` (and revoke at
+https://myaccount.google.com/permissions), or `claude mcp remove google-local -s user`.
+
 ## Security
 
 The server listens on 127.0.0.1 only, rejects non-localhost `Host` headers, and requires a

@@ -147,7 +147,7 @@ a { color: inherit; }
 
 /* ---------- messages ---------- */
 .msg { margin: 0 0 22px; }
-.msg.user { display: flex; justify-content: flex-start; }
+.msg.user { display: flex; flex-direction: column; align-items: flex-start; }
 .user-bubble {
   display: flex; gap: 10px; align-items: flex-start; max-width: 85%;
   background: var(--bubble); border-radius: 14px; padding: 10px 16px 10px 10px;
@@ -497,3 +497,21 @@ dialog.confirm p { word-break: break-word; }
 .drop-card svg { width: 34px; height: 34px; color: var(--accent); }
 .drop-card b { font: 500 20px var(--serif); }
 .drop-card span { font-size: 13px; color: var(--muted); }
+
+/* ---------- cost per prompt ---------- */
+.turn-cost { margin: 5px 0 0 12px; font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; cursor: help; white-space: nowrap; }
+.turn-cost:hover { color: var(--muted); }
+.cost-total { font-size: 12px; color: var(--muted); padding: 3px 9px; border-radius: 99px; border: 0.5px solid var(--border); font-variant-numeric: tabular-nums; cursor: help; white-space: nowrap; }
+
+/* ---------- settings ---------- */
+.settings-body { padding: 8px 24px 22px; }
+.set-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 0; }
+.set-row + .set-row { border-top: 0.5px solid var(--border); }
+.set-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.set-text b { font-weight: 500; font-size: 14px; }
+.set-text span { font-size: 12.5px; color: var(--muted); line-height: 1.45; }
+.settings .seg { flex: none; padding: 3px; border-radius: 10px; background: var(--hover); display: inline-flex; }
+.settings .seg-opt { border: 0; background: transparent; padding: 6px 12px; border-radius: 8px; font-size: 13px; color: var(--muted); }
+.settings .seg-opt:hover { color: var(--text); }
+.settings .seg-opt.sel { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.12); font-weight: 500; }
+@media (max-width: 600px) { .set-row { flex-direction: column; align-items: flex-start; } }

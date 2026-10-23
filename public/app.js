@@ -150,7 +150,8 @@ function renderSidebar() {
   const mode = $('#group-by').value;
   // Pinned chats get their own section on top and are left out of the groups below.
   const pinned = state.sessions.filter(s => s.pinned && match(s)).sort((a, b) => b.pinned - a.pinned);
-  const recent = state.sessions.filter(s => !s.pinned && match(s)).slice(0, 400);
+  const sort = $('#sort-by').value;
+  const recent = sortSessions(state.sessions.filter(s => !s.pinned && match(s)), sort).slice(0, 400);
   const row = s => {
     const st = s.hosted ? s.hosted.status : s.terminal ? s.terminal.status : null;
     const where = s.hosted ? 'here' : s.terminal ? 'terminal' : '';
@@ -161,7 +162,7 @@ function renderSidebar() {
   $('#pinned-section').hidden = !pinned.length;
   $('#pinned-list').innerHTML = pinned.map(row).join('');
   const box = $('#chat-groups');
-  const groups = groupSessions(recent, mode);
+  const groups = groupSessions(recent, mode, sort);
   const expanded = expandedGroups(mode);
   // Opening a chat leaves only its group open (all groups close for a pinned chat).
   if (state.focusGroupFor && state.focusGroupFor === state.current) {
@@ -223,8 +224,19 @@ function statusOf(s) {
   return ['3', 'Inactive'];
 }
 
-// Returns [{ key, label, hint?, title?, cwd?, items }], sessions already newest-first.
-function groupSessions(list, mode) {
+const byName = (a, b) => (a.title || '').localeCompare(b.title || '', undefined, { sensitivity: 'base', numeric: true });
+const SORTS = {
+  recent: (a, b) => b.mtime - a.mtime,
+  newest: (a, b) => (b.created || b.mtime) - (a.created || a.mtime),
+  oldest: (a, b) => (a.created || a.mtime) - (b.created || b.mtime),
+  az: byName,
+  za: (a, b) => byName(b, a),
+};
+const sortSessions = (list, sort) => list.slice().sort(SORTS[sort] || SORTS.recent);
+
+// Returns [{ key, label, hint?, title?, cwd?, items }]; items keep the order of `list` (already sorted).
+function groupSessions(list, mode, sort = 'recent') {
+  const when = s => (sort === 'newest' || sort === 'oldest' ? s.created || s.mtime : s.mtime);
   if (mode === 'none') return [{ key: 'all', label: 'All', items: list }];
   const map = new Map();
   const put = (key, meta, s) => {
@@ -232,7 +244,7 @@ function groupSessions(list, mode) {
     map.get(key).items.push(s);
   };
   for (const s of list) {
-    if (mode === 'date') { const [k, label] = dateBucket(s.mtime); put(k, { label, order: k }, s); }
+    if (mode === 'date') { const [k, label] = dateBucket(when(s)); put(k, { label, order: k }, s); }
     else if (mode === 'status') { const [k, label] = statusOf(s); put(k, { label, order: k }, s); }
     else if (mode === 'model') { const label = prettyModel(s.model || (s.hosted && s.hosted.model)); put(label, { label }, s); }
     else if (mode === 'folder') {
@@ -241,9 +253,12 @@ function groupSessions(list, mode) {
     }
   }
   const groups = [...map.values()];
-  if (mode === 'date') groups.sort((a, b) => (a.order[0] === 'm' && b.order[0] === 'm' ? b.order.localeCompare(a.order) : a.order.localeCompare(b.order)));
-  else if (mode === 'status') groups.sort((a, b) => a.order.localeCompare(b.order));
-  else groups.sort((a, b) => b.items[0].mtime - a.items[0].mtime); // most recently active first
+  if (mode === 'date') {
+    groups.sort((a, b) => (a.order[0] === 'm' && b.order[0] === 'm' ? b.order.localeCompare(a.order) : a.order.localeCompare(b.order)));
+    if (sort === 'oldest') groups.reverse();
+  } else if (mode === 'status') groups.sort((a, b) => a.order.localeCompare(b.order));
+  else if (sort === 'az' || sort === 'za') groups.sort((a, b) => (sort === 'az' ? 1 : -1) * a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }));
+  else groups.sort((a, b) => SORTS[sort === 'recent' ? 'recent' : sort](a.items[0], b.items[0])); // follows the first (top-sorted) chat
   if (mode === 'folder') {
     // same folder name in two places: show where each one lives
     const seen = {};
@@ -259,6 +274,8 @@ const expandedGroups = mode => (openGroups[mode] ||= new Set());
 
 $('#group-by').value = ['none', 'date', 'folder', 'status', 'model'].includes(pref.get('group', 'date')) ? pref.get('group', 'date') : 'date';
 $('#group-by').addEventListener('change', e => { pref.set('group', e.target.value); renderSidebar(); });
+$('#sort-by').value = Object.keys(SORTS).includes(pref.get('sort', 'recent')) ? pref.get('sort', 'recent') : 'recent';
+$('#sort-by').addEventListener('change', e => { pref.set('sort', e.target.value); renderSidebar(); });
 
 $('#chat-groups').addEventListener('click', e => {
   const add = e.target.closest('.g-new');
@@ -363,11 +380,12 @@ function updateSend() {
 
 // ------------------------------------------------------------------ thread rendering
 
-const R = { turn: null, group: null, cards: new Map(), lastCmd: null };
+const R = { turn: null, group: null, cards: new Map(), lastCmd: null, cost: null, costs: [], total: new Map() };
 
 function resetRender() {
   $('#thread').innerHTML = '';
-  R.turn = null; R.group = null; R.cards = new Map(); R.lastCmd = null;
+  R.turn = null; R.group = null; R.cards = new Map(); R.lastCmd = null; R.cost = null; R.costs = []; R.total = new Map();
+  renderCostTotal();
 }
 
 function closeTurn() { R.turn = null; R.group = null; }
@@ -485,6 +503,62 @@ function toolBody(name, input = {}) {
   return [pre(JSON.stringify(input, null, 2))];
 }
 
+// ---- cost per prompt (API-equivalent price of the tokens used for that turn)
+const fmtUSD = n => (n < 0.01 ? '<$0.01' : n < 10 ? `$${n.toFixed(2)}` : `$${n.toFixed(1)}`);
+const fmtTok = n => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n));
+
+function sumUsage(list) {
+  const t = { cost: 0, input: 0, cacheWrite: 0, cacheRead: 0, output: 0, calls: 0, models: new Set() };
+  for (const u of list) {
+    t.cost += u.cost; t.calls++;
+    t.input += u.tokens.input; t.cacheWrite += u.tokens.cacheWrite; t.cacheRead += u.tokens.cacheRead; t.output += u.tokens.output;
+    t.models.add(prettyModel(u.model));
+  }
+  t.total = t.input + t.cacheWrite + t.cacheRead + t.output;
+  return t;
+}
+
+function costTooltip(t, what) {
+  return `${what}: ${fmtUSD(t.cost)} (API-equivalent price)\n` +
+    `Input ${fmtTok(t.input)} · Cache write ${fmtTok(t.cacheWrite)} · Cache read ${fmtTok(t.cacheRead)} · Output ${fmtTok(t.output)}\n` +
+    `${t.calls} API call${t.calls === 1 ? '' : 's'} · ${[...t.models].join(', ')}\n` +
+    'On a Claude subscription you are not charged per token; this shows what the same usage would cost on the API.';
+}
+
+// Settings → Usage display: 'both' | 'cost' | 'tokens' | 'off'
+const usageMode = () => { const m = pref.get('usage', 'both'); return ['both', 'cost', 'tokens', 'off'].includes(m) ? m : 'both'; };
+
+function usageText(t, approx = '≈ ') {
+  const m = usageMode();
+  if (m === 'cost') return `${approx}${fmtUSD(t.cost)}`;
+  if (m === 'tokens') return `${fmtTok(t.total)} tokens`;
+  return `${approx}${fmtUSD(t.cost)} · ${fmtTok(t.total)} tokens`;
+}
+
+function renderTurnCost(c) {
+  if (!c.msgs.size || usageMode() === 'off') { c.el.hidden = true; return; }
+  const t = sumUsage(c.msgs.values());
+  c.el.hidden = false;
+  c.el.textContent = usageText(t);
+  c.el.title = costTooltip(t, 'This prompt');
+}
+
+function rerenderUsage() {
+  for (const c of R.costs) renderTurnCost(c);
+  renderCostTotal();
+}
+
+function renderCostTotal() {
+  const el = $('#cost-total');
+  if (!el) return;
+  if (!R.total.size || !state.current || usageMode() === 'off') { el.hidden = true; return; }
+  const t = sumUsage(R.total.values());
+  const partial = state.start > 0;
+  el.hidden = false;
+  el.textContent = usageMode() === 'tokens' ? `${partial ? '≥ ' : ''}${fmtTok(t.total)} tokens` : `${partial ? '≥ ' : '≈ '}${fmtUSD(t.cost)}`;
+  el.title = costTooltip(t, partial ? 'Loaded messages (scroll up and load earlier to include the rest)' : 'This chat so far');
+}
+
 function renderItem(it) {
   const thread = $('#thread');
   switch (it.kind) {
@@ -500,7 +574,19 @@ function renderItem(it) {
         b.onclick = () => { const c = txt.classList.toggle('clamped'); b.textContent = c ? 'Show more' : 'Show less'; };
         txt.after(b);
       }
+      const costEl = document.createElement('div');
+      costEl.className = 'turn-cost';
+      costEl.hidden = true;
+      el.appendChild(costEl);
+      R.cost = { el: costEl, msgs: new Map() };
+      R.costs.push(R.cost);
       insertBeforeTail(el);
+      break;
+    }
+    case 'usage': {
+      R.total.set(it.msg, it);
+      if (R.cost) { R.cost.msgs.set(it.msg, it); renderTurnCost(R.cost); }
+      renderCostTotal();
       break;
     }
     case 'text':
@@ -1265,6 +1351,25 @@ $('#main').addEventListener('drop', e => {
   addFiles(e.dataTransfer.files);
   input.focus();
 });
+
+// ------------------------------------------------------------------ settings
+
+function openSettings() {
+  const dlg = $('#settings-dialog');
+  const sync = () => dlg.querySelectorAll('.seg-opt').forEach(b => {
+    const on = b.dataset.usage === usageMode();
+    b.classList.toggle('sel', on);
+    b.setAttribute('aria-checked', String(on));
+  });
+  dlg.querySelectorAll('.seg-opt').forEach(b => {
+    b.onclick = () => { pref.set('usage', b.dataset.usage); sync(); rerenderUsage(); };
+  });
+  sync();
+  dlg.showModal();
+}
+$('#settings-btn').onclick = openSettings;
+$('#settings-close').onclick = () => $('#settings-dialog').close();
+$('#settings-dialog').addEventListener('click', e => { if (e.target === e.currentTarget) e.currentTarget.close(); });
 
 // ------------------------------------------------------------------ boot
 

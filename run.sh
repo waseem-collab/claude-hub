@@ -18,6 +18,18 @@ if [ "${1:-}" = "--browser" ]; then
   exec xdg-open "$URL"
 fi
 
+# Use Node 18+ for building: an old system node (e.g. /usr/bin/node 12) breaks electron-builder.
+node_ok() { command -v node >/dev/null && [ "$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)" -ge 18 ]; }
+if ! node_ok && [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+  # shellcheck disable=SC1091
+  . "${NVM_DIR:-$HOME/.nvm}/nvm.sh" >/dev/null 2>&1 && nvm use --silent default >/dev/null 2>&1 || true
+fi
+if ! node_ok; then
+  for d in "$HOME"/.nvm/versions/node/*/bin; do
+    [ -x "$d/node" ] && [ "$("$d/node" -p 'process.versions.node.split(".")[0]')" -ge 18 ] && PATH="$d:$PATH"
+  done
+fi
+
 APP_DIR="$HOME/.local/opt/claude-hub"
 APP="$APP_DIR/claude-hub"
 STAMP="$APP_DIR/.source-hash"

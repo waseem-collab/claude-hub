@@ -202,6 +202,7 @@ const Dropdown = (() => {
 })();
 
 Dropdown.enhanceSelect(document.getElementById('group-by'), { align: 'end' });
+Dropdown.enhanceSelect(document.getElementById('sort-by'), { align: 'end' });
 Dropdown.enhanceSelect(document.getElementById('perm-mode'));
 Dropdown.enhanceSelect(document.getElementById('model'), { align: 'end' });
 
