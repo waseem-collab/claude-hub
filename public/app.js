@@ -1,6 +1,14 @@
 'use strict';
 
 const TOKEN = window.HUB_TOKEN;
+
+// Split view: the window can show up to 5 chats side by side. Each pane is this same page loaded
+// in an iframe with ?pane=1. Panes don't open their own live connection (browsers allow only ~6
+// per server); the window holds one connection for all panes and forwards events to them.
+const PANE = new URLSearchParams(location.search).has('pane');
+if (PANE) document.documentElement.classList.add('pane-mode');
+const MAX_PANES = 5;
+const split = { active: false, panes: [], focus: 0, es: null, timer: null }; // pane: { el, frame, id }
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -141,6 +149,12 @@ function md(text) {
 
 // ------------------------------------------------------------------ sidebar
 
+function sessClass(id) {
+  if (!split.active) return id === state.current ? ' active' : '';
+  if (split.panes[split.focus] && split.panes[split.focus].id === id) return ' active';
+  return split.panes.some(p => p.id === id) ? ' in-pane' : '';
+}
+
 function renderSidebar() {
   // don't wipe an open rename box; render once it closes
   if (state.renaming) { state.sidebarStale = true; return; }
@@ -157,7 +171,7 @@ function renderSidebar() {
     const where = s.hosted ? 'here' : s.terminal ? 'terminal' : '';
     const dot = st ? `<span class="dot ${st === 'busy' || st === 'starting' ? 'busy' : 'idle'}" title="${esc(where)} · ${esc(st)}"></span>` : '';
     const sub = s.hosted && s.hosted.temporary ? ['temporary · not saved', ago(s.mtime)].join(' · ') : [mode === 'folder' ? '' : base(s.cwd), where && (st === 'busy' ? `working in ${where}` : `open in ${where}`), ago(s.mtime)].filter(Boolean).join(' · ');
-    return `<li class="sess-li" data-id="${s.id}"><a class="sess${s.id === state.current ? ' active' : ''}" href="#/s/${s.id}"><span class="txt"><span class="t">${esc(s.title)}</span><span class="sub">${esc(sub)}</span></span>${dot}</a><button type="button" class="icon-btn xs sess-more" aria-label="More options for ${esc(s.title)}" title="More"><svg viewBox="0 0 16 16" width="15" height="15"><circle cx="3.5" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="12.5" cy="8" r="1.3" fill="currentColor"/></svg></button></li>`;
+    return `<li class="sess-li" data-id="${s.id}"><a class="sess${sessClass(s.id)}" href="#/s/${s.id}"><span class="txt"><span class="t">${esc(s.title)}</span><span class="sub">${esc(sub)}</span></span>${dot}</a><button type="button" class="icon-btn xs sess-more" aria-label="More options for ${esc(s.title)}" title="More"><svg viewBox="0 0 16 16" width="15" height="15"><circle cx="3.5" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="12.5" cy="8" r="1.3" fill="currentColor"/></svg></button></li>`;
   };
   $('#pinned-section').hidden = !pinned.length;
   $('#pinned-list').innerHTML = pinned.map(row).join('');
@@ -762,12 +776,9 @@ async function loadEarlier() {
 
 // ------------------------------------------------------------------ live events
 
-function connect(sessionId) {
-  if (state.es) state.es.close();
-  const es = new EventSource(`/api/events?token=${TOKEN}${sessionId ? `&session=${sessionId}` : ''}`);
-  state.es = es;
-  es.addEventListener('sessions', e => {
-    state.sessions = JSON.parse(e.data);
+function handleEvent(type, d) {
+  if (type === 'sessions') {
+    state.sessions = d;
     renderSidebar();
     if (state.current) {
       const s = currentSession();
@@ -775,18 +786,27 @@ function connect(sessionId) {
       if (s && !s.hosted && state.hostStatus && state.hostStatus !== 'exited') state.hostStatus = null;
       renderChrome();
     }
-  });
-  es.addEventListener('items', e => {
-    if (es !== state.es) return;
-    const d = JSON.parse(e.data);
-    appendItems(d.from, d.items);
-  });
-  es.addEventListener('host', e => { if (es === state.es) onHost(JSON.parse(e.data)); });
+    return;
+  }
+  if (d.sid && d.sid !== state.current) return;
+  if (type === 'items') appendItems(d.from, d.items);
+  else if (type === 'host') onHost(d);
+}
+
+function connect(sessionId) {
+  if (state.es) { state.es.close(); state.es = null; }
+  if (PANE) { toWindow({ hub: 'sub', id: sessionId || null }); return; }
+  if (split.active) return; // the split connection serves the panes
+  const es = new EventSource(`/api/events?token=${TOKEN}${sessionId ? `&session=${sessionId}` : ''}`);
+  state.es = es;
+  for (const type of ['sessions', 'items', 'host']) {
+    es.addEventListener(type, e => { if (es === state.es) handleEvent(type, JSON.parse(e.data)); });
+  }
 }
 
 // System notification when a reply finishes while the window isn't in front.
 function notifyDone(evt) {
-  if (!('Notification' in window) || document.hasFocus()) return;
+  if (!('Notification' in window) || (PANE ? window.parent.document.hasFocus() : document.hasFocus())) return;
   const s = currentSession();
   const show = () => {
     const n = new Notification(s ? s.title : 'Claude Hub', { body: evt.isError ? 'Claude hit an error' : 'Claude finished replying', icon: '/favicon.svg', silent: false });
@@ -978,6 +998,7 @@ function showNew() {
 }
 
 function route() {
+  if (split.active) { paneGo(split.focus, location.hash.startsWith('#/s/') ? location.hash : '#/new'); return; }
   const m = location.hash.match(/^#\/s\/([\w-]+)/);
   if (m) openSession(m[1]); else showNew();
 }
@@ -1059,7 +1080,8 @@ $('#composer').addEventListener('submit', async e => {
       pref.set('cwd', cwd);
       input.value = ''; clearAttachments(); autosize(); updateSend();
       location.hash = `#/s/${r.id}`;
-      setTimeout(() => optimisticUser(text), 50);
+      // placeholder until the real message arrives, unless the chat already loaded it (temporary chats)
+      setTimeout(() => { if (!state.items.some(it => it.kind === 'user')) optimisticUser(text); }, 50);
     } catch (err) { toast(err.message, true); }
     return;
   }
@@ -1131,6 +1153,7 @@ $('#theme-btn').onclick = () => {
   const dark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
   root.dataset.theme = dark ? 'light' : 'dark';
   pref.set('theme', root.dataset.theme);
+  toPanes({ hub: 'theme', theme: root.dataset.theme });
 };
 
 document.addEventListener('keydown', e => {
@@ -1142,6 +1165,7 @@ setInterval(() => { if (!$('#search').matches(':focus')) renderSidebar(); }, 600
 
 // ------------------------------------------------------------------ rename / delete chats
 
+const ICON_SPLIT = '<svg viewBox="0 0 16 16" width="15" height="15"><rect x="2" y="2.8" width="12" height="10.4" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.25"/><path d="M8 2.8v10.4" stroke="currentColor" stroke-width="1.25"/></svg>';
 const ICON_PIN = '<svg viewBox="0 0 16 16" width="15" height="15"><path d="M10.2 2.2l3.6 3.6-2.3 1.1-2.6 2.6.4 2.9-1.2 1.2-2.6-2.6L2.8 13.7M5.5 8.4L3 5.9l1.2-1.2 2.9.4 2.6-2.6z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" stroke-linecap="round"/></svg>';
 const ICON_PEN = '<svg viewBox="0 0 16 16" width="15" height="15"><path d="M10.5 2.5l3 3L6 13H3v-3z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>';
 const ICON_TRASH = '<svg viewBox="0 0 20 20" width="15" height="15"><path d="M4.5 6h11M8 6V4.5h4V6M6 6l.7 10h6.6L14 6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -1151,11 +1175,12 @@ function chatMenu(anchor, id) {
   Dropdown.open({
     anchor, align: 'end',
     items: [
+      { value: 'split', label: 'Open side by side', icon: ICON_SPLIT },
       { value: 'pin', label: state.sessions.find(x => x.id === id)?.pinned ? 'Unpin' : 'Pin', icon: ICON_PIN },
       { value: 'rename', label: 'Rename', icon: ICON_PEN },
       { value: 'delete', label: 'Delete', icon: ICON_TRASH, danger: true },
     ],
-    onPick: v => (v === 'pin' ? togglePin(id) : v === 'rename' ? renameInSidebar(id) : deleteChat(id)),
+    onPick: v => (v === 'split' ? openSideBySide(id) : v === 'pin' ? togglePin(id) : v === 'rename' ? renameInSidebar(id) : deleteChat(id)),
     onClose: () => anchor.classList.remove('open'),
   });
 }
@@ -1362,7 +1387,7 @@ function openSettings() {
     b.setAttribute('aria-checked', String(on));
   });
   dlg.querySelectorAll('.seg-opt').forEach(b => {
-    b.onclick = () => { pref.set('usage', b.dataset.usage); sync(); rerenderUsage(); };
+    b.onclick = () => { pref.set('usage', b.dataset.usage); sync(); rerenderUsage(); toPanes({ hub: 'usage' }); };
   });
   sync();
   dlg.showModal();
@@ -1370,6 +1395,169 @@ function openSettings() {
 $('#settings-btn').onclick = openSettings;
 $('#settings-close').onclick = () => $('#settings-dialog').close();
 $('#settings-dialog').addEventListener('click', e => { if (e.target === e.currentTarget) e.currentTarget.close(); });
+
+// ------------------------------------------------------------------ split view
+
+const toWindow = msg => { try { window.parent.postMessage(msg, location.origin); } catch { /* not in a pane */ } };
+function toPane(p, msg) { try { p.frame.contentWindow.postMessage(msg, location.origin); } catch { /* still loading */ } }
+function toPanes(msg) { for (const p of split.panes) toPane(p, msg); }
+
+function splitSave() {
+  pref.set('split', split.active ? JSON.stringify({ ids: split.panes.map(p => p.id), focus: split.focus }) : '');
+}
+
+function makePane(id) {
+  const el = document.createElement('div');
+  el.className = 'pane';
+  const frame = document.createElement('iframe');
+  frame.title = 'Chat';
+  frame.src = `/?pane=1${id ? `#/s/${id}` : '#/new'}`;
+  el.appendChild(frame);
+  $('#panes').appendChild(el);
+  return { el, frame, id: id || null };
+}
+
+function setFocus(i) {
+  split.focus = Math.max(0, Math.min(i, split.panes.length - 1));
+  split.panes.forEach((p, j) => { p.el.classList.toggle('focused', j === split.focus); toPane(p, { hub: 'focused', on: j === split.focus }); });
+  renderSidebar();
+  splitSave();
+}
+
+// One live connection for every chat shown in a pane; reconnects when the set changes.
+function resubscribe(force) {
+  clearTimeout(split.timer);
+  split.timer = setTimeout(() => {
+    const ids = [...new Set(split.panes.map(p => p.id).filter(Boolean))];
+    const key = ids.join(',');
+    if (!force && split.es && split.es.key === key) return;
+    if (split.es) split.es.close();
+    split.es = null;
+    if (!split.active) return;
+    const es = new EventSource(`/api/events?token=${TOKEN}${ids.map(id => `&session=${id}`).join('')}`);
+    es.key = key;
+    split.es = es;
+    for (const type of ['sessions', 'items', 'host']) {
+      es.addEventListener(type, e => {
+        if (es !== split.es) return;
+        const d = JSON.parse(e.data);
+        if (type === 'sessions') { state.sessions = d; renderSidebar(); toPanes({ hub: 'evt', type, data: d }); return; }
+        for (const p of split.panes) if (p.id && p.id === d.sid) toPane(p, { hub: 'evt', type, data: d });
+      });
+    }
+  }, 120);
+}
+
+function enterSplit(ids, focus) {
+  if (state.es) { state.es.close(); state.es = null; }
+  split.active = true;
+  document.body.classList.add('split');
+  for (const id of ids) split.panes.push(makePane(id));
+  setFocus(focus == null ? split.panes.length - 1 : focus);
+  resubscribe(true);
+}
+
+function exitSplit(keepId) {
+  split.active = false;
+  clearTimeout(split.timer);
+  if (split.es) { split.es.close(); split.es = null; }
+  for (const p of split.panes) p.el.remove();
+  split.panes = [];
+  document.body.classList.remove('split');
+  splitSave();
+  state.current = '\u0000'; // force the normal view to reload and reconnect
+  const hash = keepId ? `#/s/${keepId}` : '#/new';
+  if (location.hash !== hash) location.hash = hash; else route();
+}
+
+function openSideBySide(id) {
+  if (!split.active) {
+    const first = state.current && state.current !== id ? state.current : null;
+    enterSplit(first || id === null ? [first, id] : [id, null]);
+    return;
+  }
+  const at = id ? split.panes.findIndex(p => p.id === id) : -1;
+  if (at >= 0) { setFocus(at); return; }
+  if (split.panes.length >= MAX_PANES) { toast(`Up to ${MAX_PANES} chats side by side. Close one first.`, true); return; }
+  split.panes.push(makePane(id));
+  setFocus(split.panes.length - 1);
+  resubscribe();
+}
+
+function closePane(i) {
+  const [p] = split.panes.splice(i, 1);
+  if (!p) return;
+  p.el.remove();
+  if (split.panes.length === 1) { exitSplit(split.panes[0].id); return; }
+  setFocus(Math.min(split.focus >= i ? split.focus - 1 : split.focus, split.panes.length - 1));
+  resubscribe();
+}
+
+function paneGo(i, hash, cwd) {
+  const p = split.panes[i];
+  if (p) toPane(p, { hub: 'go', hash, cwd });
+}
+
+if (PANE) {
+  // Messages from the window: forwarded live events, navigation, focus, theme/settings changes.
+  window.addEventListener('message', e => {
+    const m = e.data;
+    if (e.origin !== location.origin || !m || !m.hub) return;
+    if (m.hub === 'evt') handleEvent(m.type, m.data);
+    else if (m.hub === 'go') {
+      if (m.cwd) $('#cwd-input').value = m.cwd;
+      if (location.hash !== m.hash) location.hash = m.hash; else route();
+    } else if (m.hub === 'focused') document.documentElement.classList.toggle('pane-focused', !!m.on);
+    else if (m.hub === 'theme') document.documentElement.dataset.theme = m.theme;
+    else if (m.hub === 'usage') rerenderUsage();
+  });
+  const focusMe = () => toWindow({ hub: 'focus' });
+  document.addEventListener('pointerdown', focusMe, true);
+  document.addEventListener('focusin', focusMe);
+  $('#pane-close').onclick = () => toWindow({ hub: 'close' });
+} else {
+  window.addEventListener('message', e => {
+    const m = e.data;
+    if (e.origin !== location.origin || !m || !m.hub) return;
+    const i = split.panes.findIndex(p => p.frame.contentWindow === e.source);
+    if (i < 0) return;
+    const p = split.panes[i];
+    if (m.hub === 'sub') {
+      // a pane opened a chat (or a new chat got its id): follow it, and resend live state for it
+      p.id = m.id;
+      toPane(p, { hub: 'focused', on: i === split.focus });
+      resubscribe(true);
+      renderSidebar();
+      splitSave();
+    } else if (m.hub === 'focus') { if (split.focus !== i) setFocus(i); }
+    else if (m.hub === 'close') closePane(i);
+  });
+
+  $('#split-btn').onclick = () => openSideBySide(null);
+
+  // Sidebar: Ctrl/Cmd+click or middle-click opens a chat side by side; in split view a plain click
+  // loads it into the focused pane.
+  $('#nav').addEventListener('click', e => {
+    const a = e.target.closest('a.sess');
+    if (!a || e.target.closest('.sess-more')) return;
+    const id = a.closest('.sess-li').dataset.id;
+    if (e.ctrlKey || e.metaKey) { e.preventDefault(); openSideBySide(id); }
+    else if (split.active) { e.preventDefault(); paneGo(split.focus, `#/s/${id}`); }
+  }, true);
+  $('#nav').addEventListener('auxclick', e => {
+    const a = e.target.closest('a.sess');
+    if (!a || e.button !== 1) return;
+    e.preventDefault();
+    openSideBySide(a.closest('.sess-li').dataset.id);
+  });
+  for (const link of document.querySelectorAll('a[href="#/new"]')) {
+    link.addEventListener('click', e => { if (split.active) { e.preventDefault(); paneGo(split.focus, '#/new'); } }, true);
+  }
+  $('#chat-groups').addEventListener('click', e => {
+    const add = e.target.closest('.g-new');
+    if (add && split.active) { e.preventDefault(); e.stopImmediatePropagation(); paneGo(split.focus, '#/new', add.dataset.cwd); }
+  }, true);
+}
 
 // ------------------------------------------------------------------ boot
 
@@ -1382,5 +1570,10 @@ $('#settings-dialog').addEventListener('click', e => { if (e.target === e.curren
     $('#cwd-input').placeholder = dirs.dirs[0] || dirs.home;
     $('#cwd-input').value = pref.get('cwd', '');
   } catch (e) { toast('Could not reach the Claude Hub server', true); }
-  route();
+  let saved = null;
+  if (!PANE) { try { saved = JSON.parse(pref.get('split', '') || 'null'); } catch { saved = null; } }
+  if (saved && Array.isArray(saved.ids) && saved.ids.length >= 2) {
+    renderSidebar();
+    enterSplit(saved.ids.slice(0, MAX_PANES), saved.focus);
+  } else route();
 })();

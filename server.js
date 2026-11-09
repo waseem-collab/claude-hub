@@ -548,7 +548,7 @@ class Host {
     if (!items.length) return;
     const from = this.items.length;
     this.items.push(...items);
-    for (const c of subscribersOf(this.id)) sse(c.res, 'items', { from, items });
+    for (const c of subscribersOf(this.id)) sse(c.res, 'items', { sid: this.id, from, items });
   }
 
   send(text) {
@@ -666,16 +666,18 @@ async function waitForExit(pid, ms) {
 
 // ---------------------------------------------------------------- server-sent events
 
-const clients = new Set(); // { res, session }
+// Each client follows any number of chats (split view shares one connection across panes).
+// Events carry `sid` so the page can route them to the right pane.
+const clients = new Set(); // { res, sessions: Set<id> }
 
-function subscribersOf(id) { return [...clients].filter(c => c.session === id); }
+function subscribersOf(id) { return [...clients].filter(c => c.sessions.has(id)); }
 
 function sse(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 function publish(id, evt) {
-  for (const c of clients) if (c.session === id) sse(c.res, 'host', evt);
+  for (const c of clients) if (c.sessions.has(id)) sse(c.res, 'host', { ...evt, sid: id });
 }
 
 let lastListSig = '';
@@ -688,13 +690,13 @@ function broadcastSessions(force) {
 }
 
 async function tickTranscripts() {
-  const watched = new Set([...clients].map(c => c.session).filter(Boolean));
+  const watched = new Set([...clients].flatMap(c => [...c.sessions]));
   for (const id of watched) {
     const t = transcripts.get(id);
     if (!t) continue;
     const from = t.items.length;
     const added = await advanceTranscript(t);
-    if (added.length) for (const c of subscribersOf(id)) sse(c.res, 'items', { from, items: added });
+    if (added.length) for (const c of subscribersOf(id)) sse(c.res, 'items', { sid: id, from, items: added });
   }
 }
 
@@ -704,8 +706,10 @@ async function tickIndex() {
   // A watched session may have been created or moved after the subscriber connected.
   // Start at offset 0 so tickTranscripts streams its existing items to the subscriber.
   for (const c of clients) {
-    const m = c.session && sessions.get(c.session);
-    if (m && !transcripts.has(c.session)) transcripts.set(c.session, { file: m.file, offset: 0, partial: '', items: [] });
+    for (const id of c.sessions) {
+      const m = sessions.get(id);
+      if (m && !transcripts.has(id)) transcripts.set(id, { file: m.file, offset: 0, partial: '', items: [] });
+    }
   }
   broadcastSessions(false);
 }
@@ -771,16 +775,17 @@ async function api(req, res, url) {
   const method = req.method;
 
   if (method === 'GET' && parts[1] === 'events') {
-    const session = url.searchParams.get('session') || null;
+    // ?session=a&session=b… (up to 8)
+    const ids = [...new Set(url.searchParams.getAll('session').filter(Boolean))].slice(0, 8);
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
-    const client = { res, session };
+    const client = { res, sessions: new Set(ids) };
     clients.add(client);
     sse(res, 'sessions', sessionList());
-    if (session) {
-      const h = hosts.get(session);
+    for (const id of ids) {
+      const h = hosts.get(id);
       if (h) {
-        sse(res, 'host', { t: 'status', state: h.status });
-        for (const p of h.pending.values()) sse(res, 'host', { t: 'perm', ...p, input: shrinkInput(p.input) });
+        sse(res, 'host', { t: 'status', state: h.status, sid: id });
+        for (const p of h.pending.values()) sse(res, 'host', { t: 'perm', ...p, input: shrinkInput(p.input), sid: id });
       }
     }
     req.on('close', () => clients.delete(client));

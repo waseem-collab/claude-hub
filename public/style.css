@@ -515,3 +515,25 @@ dialog.confirm p { word-break: break-word; }
 .settings .seg-opt:hover { color: var(--text); }
 .settings .seg-opt.sel { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.12); font-weight: 500; }
 @media (max-width: 600px) { .set-row { flex-direction: column; align-items: flex-start; } }
+
+/* ---------- split view ---------- */
+#panes { display: none; }
+body.split #main { display: none; }
+body.split #panes { display: flex; flex: 1; min-width: 0; overflow-x: auto; background: var(--bg); }
+.pane { position: relative; flex: 1 1 0; min-width: 360px; display: flex; border-left: 0.5px solid var(--border-strong); }
+.pane:first-child { border-left: 0; }
+.pane iframe { flex: 1; width: 100%; height: 100%; border: 0; background: var(--bg); }
+.pane.focused::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--accent); z-index: 2; pointer-events: none; }
+.sess.in-pane { background: var(--hover); }
+#pane-close { display: none; }
+html.pane-mode #pane-close { display: grid; }
+html.pane-mode #split-btn, #main.new #split-btn { display: none; }
+html.pane-mode #sidebar, html.pane-mode #scrim, html.pane-mode #sb-open { display: none !important; }
+html.pane-mode #thread { padding: 8px 18px 28px; }
+html.pane-mode #composer-wrap { padding: 0 12px 8px; }
+html.pane-mode #topbar { padding: 0 8px 0 14px; gap: 6px; }
+html.pane-mode #cwd-chip, html.pane-mode #resume-btn span { display: none; }
+html.pane-mode .foot-note { display: none; }
+html.pane-mode .folder-pick input { width: 140px; }
+html.pane-mode #main.new #scroller { margin-top: 12vh; }
+html.pane-mode .greet h2 { font-size: 28px; }
