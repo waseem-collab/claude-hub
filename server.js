@@ -310,11 +310,12 @@ async function readMeta(id, file, st, prev) {
     const objs = parseLines(await readChunk(file, 0, Math.min(HEAD, st.size)), false);
     const withCwd = objs.find(o => o.cwd);
     const firstTs = objs.find(o => o.timestamp);
-    head = { cwd: withCwd ? withCwd.cwd : null, firstPrompt: firstHumanPrompt(objs), headComplete: st.size > HEAD || !!firstHumanPrompt(objs), created: firstTs ? Date.parse(firstTs.timestamp) : null };
+    const withEntry = objs.find(o => o.entrypoint);
+    head = { cwd: withCwd ? withCwd.cwd : null, firstPrompt: firstHumanPrompt(objs), headComplete: st.size > HEAD || !!firstHumanPrompt(objs), created: firstTs ? Date.parse(firstTs.timestamp) : null, entrypoint: withEntry ? withEntry.entrypoint : null };
     head.headTitle = null;
     for (const o of objs) if (o.type === 'ai-title' || o.type === 'custom-title' || o.type === 'summary') head.headTitle = o.customTitle || o.aiTitle || o.summary || head.headTitle;
   }
-  Object.assign(m, { cwd: head.cwd, firstPrompt: head.firstPrompt, headComplete: head.headComplete, headTitle: head.headTitle, created: head.created || (prev && prev.created) || st.birthtimeMs || st.mtimeMs });
+  Object.assign(m, { cwd: head.cwd, firstPrompt: head.firstPrompt, headComplete: head.headComplete, headTitle: head.headTitle, entrypoint: head.entrypoint || (prev && prev.entrypoint) || null, created: head.created || (prev && prev.created) || st.birthtimeMs || st.mtimeMs });
 
   const tailStart = Math.max(0, st.size - TAIL);
   const tail = parseLines(await readChunk(file, tailStart, st.size - tailStart), tailStart > 0);
@@ -329,6 +330,8 @@ async function readMeta(id, file, st, prev) {
     if (o.type === 'assistant' && o.message && o.message.model && o.message.model !== '<synthetic>') model = o.message.model;
     if (!m.cwd && o.cwd) m.cwd = o.cwd;
   }
+  // named = has a real title (Claude Code's ai-title, a rename, or a summary), not just the first prompt
+  m.named = !!(customTitle || aiTitle || head.headTitle) || !!(prev && prev.named);
   m.title = customTitle || aiTitle || (prev && prev.title !== prev.firstPrompt ? prev.title : null) || head.headTitle || m.firstPrompt || lastPrompt || '';
   m.title = m.title.replace(/\s+/g, ' ').slice(0, 120);
   m.permissionMode = mode || (prev && prev.permissionMode) || null;
@@ -479,6 +482,97 @@ function launchConfig() {
   return { args, env };
 }
 
+// ---------------------------------------------------------------- automatic chat names
+
+// Claude Code names chats itself only in the terminal; chats started from the hub would otherwise
+// be named after their first message. After a chat's first reply we ask Haiku for a short name and
+// save it as an `ai-title` entry, the same record Claude Code writes, so terminals see it too.
+const titleQueue = [];
+const titleDone = new Set(); // ids already named (or tried) this run
+let titleRunning = false;
+
+function needsTitle(id) {
+  if (titles[id] || titleDone.has(id)) return false;
+  const h = hosts.get(id);
+  if (h && h.temp) return !h.named;
+  const m = sessions.get(id);
+  return !!(m && !m.named && (m.entrypoint === 'sdk-cli' || (h && !h.temp)));
+}
+
+function queueTitle(id) {
+  if (!needsTitle(id) || titleQueue.includes(id)) return;
+  titleQueue.push(id);
+  runTitleQueue();
+}
+
+async function conversationStart(id) {
+  const h = hosts.get(id);
+  let items = h && h.temp ? h.items : null;
+  if (!items) { const t = await loadTranscript(id); items = t ? t.items : []; }
+  const user = items.find(it => it.kind === 'user' && it.text);
+  const reply = items.find(it => it.kind === 'text');
+  if (!user || !reply) return null;
+  const clip = s => String(s).replace(/\[Attached file: ([^\]]+)\]/g, (_, p) => `[file ${path.basename(p)}]`).slice(0, 1500);
+  return `User: ${clip(user.text)}\n\nClaude: ${clip(reply.text)}`;
+}
+
+function generateTitle(convo) {
+  return new Promise(resolve => {
+    const prompt = `Here is the start of a conversation between a user and Claude Code.\n\n${convo}\n\n` +
+      'Write a short title for this conversation: 3 to 6 words, sentence case, no quotes, no trailing period. ' +
+      'Describe the task, not the greeting. Reply with the title only.';
+    const p = spawn(CLAUDE_BIN, ['-p', '--model', 'haiku', '--no-session-persistence', '--tools', '', '--output-format', 'text'],
+      { cwd: os.homedir(), env: process.env, stdio: ['pipe', 'pipe', 'ignore'] });
+    let out = '';
+    const timer = setTimeout(() => p.kill(), 60000);
+    p.stdout.on('data', d => { out += d; });
+    p.on('error', () => { clearTimeout(timer); resolve(null); });
+    p.on('close', code => {
+      clearTimeout(timer);
+      const line = out.trim().split('\n').filter(Boolean).pop() || '';
+      const t = line.replace(/^(title:\s*)/i, '').replace(/^["'*`]+|["'*`.]+$/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
+      resolve(code === 0 && t.length >= 2 ? t : null);
+    });
+    p.stdin.end(prompt);
+  });
+}
+
+async function runTitleQueue() {
+  if (titleRunning) return;
+  titleRunning = true;
+  try {
+    while (titleQueue.length) {
+      const id = titleQueue.shift();
+      if (!needsTitle(id)) continue;
+      const convo = await conversationStart(id);
+      if (!convo) continue; // no reply yet; try again after the next one
+      titleDone.add(id);
+      const title = await generateTitle(convo);
+      if (!title || titles[id]) continue;
+      const h = hosts.get(id);
+      if (h && h.temp) { h.title = title; h.named = true; }
+      else {
+        const m = sessions.get(id);
+        if (!m) continue;
+        await fsp.appendFile(m.file, JSON.stringify({ type: 'ai-title', aiTitle: title, sessionId: id }) + '\n');
+        m.title = title; m.named = true;
+      }
+      broadcastSessions(true);
+    }
+  } catch (e) {
+    console.error('title generation failed:', e.message);
+  } finally {
+    titleRunning = false;
+  }
+}
+
+// Name existing hub chats that only have their first message as a name (newest first, a few at a time).
+function backfillTitles() {
+  const unnamed = [...sessions.values()].filter(m => !m.named && m.entrypoint === 'sdk-cli' && !titles[m.id] && !terminalLive.has(m.id))
+    .sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, 30);
+  for (const m of unnamed) queueTitle(m.id);
+}
+
 // ---------------------------------------------------------------- hosted claude processes
 
 const hosts = new Map(); // sessionId -> Host
@@ -621,6 +715,7 @@ class Host {
     }
     if (evt.type === 'result') {
       this.setStatus('idle');
+      if (!evt.is_error) queueTitle(this.id);
       this.emit({ t: 'result', isError: !!evt.is_error, cost: evt.total_cost_usd, durationMs: evt.duration_ms, text: evt.is_error ? evt.result : undefined });
       return;
     }
@@ -1039,6 +1134,7 @@ async function start() {
     server.listen(PORT, HOST, () => {
       console.log(`Claude Hub running at http://localhost:${PORT}`);
       console.log(`Using claude at ${CLAUDE_BIN} · ${sessions.size} sessions found`);
+      if (!process.env.HUB_NO_TITLE_BACKFILL) setTimeout(backfillTitles, 5000).unref();
       resolve();
     });
   });

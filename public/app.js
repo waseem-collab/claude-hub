@@ -1161,6 +1161,33 @@ document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'o') { e.preventDefault(); location.hash = '#/new'; }
 });
 
+// Typing anywhere goes to the message box: no need to click it first.
+const isEditable = el => !!el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+document.addEventListener('keydown', e => {
+  if (e.defaultPrevented || e.isComposing) return;
+  const t = document.activeElement;
+  if (isEditable(t) || document.querySelector('dialog[open], .dd-menu')) return;
+  const paste = (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'v';
+  const printable = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+  if (!paste && !printable) return;
+  if (e.key === ' ' && t && t.closest && t.closest('button, a, summary, [role="button"]')) return; // Space presses buttons
+  if (split.active) {
+    // the window (sidebar) has focus: send the keys to the focused pane's message box
+    const p = split.panes[split.focus];
+    const box = p && p.frame.contentDocument && p.frame.contentDocument.querySelector('#input');
+    if (!box) return;
+    p.frame.focus();
+    box.focus();
+    if (printable) {
+      e.preventDefault();
+      box.setRangeText(e.key, box.selectionStart, box.selectionEnd, 'end');
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    return;
+  }
+  $('#input').focus(); // the key itself then lands in the box
+});
+
 setInterval(() => { if (!$('#search').matches(':focus')) renderSidebar(); }, 60000);
 
 // ------------------------------------------------------------------ rename / delete chats
